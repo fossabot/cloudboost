@@ -487,15 +487,13 @@ mongoService.collection = {
 
         try {
 
-            var _self = mongoService;
+            var collection = config.mongoClient.db(appId).collection(oldCollectionName);
 
-            var collection = config.mongoClient.db(appId).collection(_self.collection.getId(appId, oldCollectionName));
-
-            collection.rename(_self.collection.getId(appId, newCollectionName), function(err, _collection) {
+            collection.rename(newCollectionName, function(err, _collection) {
                 if (err) {
                     if (err.message === 'source namespace does not exist') {
                          //if oldCollectionName is not found.
-                        deferred.resolve();
+                        deferred.reject('Table not found, check and try again');
                     } else {
 
                         winston.log('error', err);

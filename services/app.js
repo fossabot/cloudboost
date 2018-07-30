@@ -285,8 +285,6 @@ module.exports = {
             findQuery.toArray(function (err, tables) {
                 if (err) {
                     deferred.reject("Error : Failed to retrieve the table.");
-
-
                 }
                 if (tables && tables.length > 0) {
                     deferred.resolve(tables[0]);
@@ -307,31 +305,24 @@ module.exports = {
     },
 
     getAllTables: function (appId) {
-
-
-
         var deferred = q.defer();
-
         try {
-
             var collection = config.mongoClient.db(appId).collection("_Schema");
             var findQuery = collection.find({});
             findQuery.toArray(function (err, tables) {
                 if (err) {
-                    deferred.reject("Error : Failed to retrieve the table.");
-
-
+                    return deferred.reject("Error : Failed to retrieve the table.");
                 }
                 if (tables.length > 0) {
                     // filtering out private '_Tables'
-                    tables = tables.filter(function (table) {
-                        return table.name[0] !== '_';
+                    var filteredTables = tables.filter(function (table) {
+                        return table.name && table.name[0] !== '_';
                     });
 
-                    deferred.resolve(tables);
+                    return deferred.resolve(filteredTables);
                 } else {
 
-                    deferred.resolve([]);
+                    return deferred.resolve([]);
                 }
             });
 
@@ -1106,6 +1097,14 @@ module.exports = {
         }
         );
         return deferred.promise;
+    },
+
+    renameTable: function (appId, oldTableName, newTableName) {
+        return mongoUtil.collection.renameCollection(appId, oldTableName, newTableName)
+        .then(_updateRenamedCollectionRecords(oldTableName, newTableName))
+        .then(_updateTableRelations(appId, oldTableName, newTableName))
+        .then(_updateColumnData(appId, oldTableName, newTableName))
+        .then(_renameTableInSchema(appId, oldTableName, newTableName));
     }
 };
 
@@ -1583,4 +1582,187 @@ function makeid(len) {
       text += possible.charAt(Math.floor(Math.random() * possible.length));
 
     return text;
+}
+
+function _updateRenamedCollectionRecords (oldTableName, newTableName){
+    return function (renamedCollection) {
+        var deferred = q.defer();
+        renamedCollection.updateMany({
+           _tableName: oldTableName
+        }, {
+            $set: {
+                _tableName: newTableName
+            }
+        }, {w: 1}, function (err, updated) {
+            if(err){
+                return deferred.reject(err);
+            }
+
+            return deferred.resolve(updated);
+        });
+        return deferred.promise;
+    };
+}
+
+function _updateTableRelations(appId, oldTableName, newTableName){
+    return function () {
+        var deferred = q.defer();
+
+        var schemaCollection = config.mongoClient.db(appId).collection('_Schema');
+
+        var query = {
+            'columns.relatedTo': oldTableName
+        };
+
+        var updateQry = { $set: { "columns.$.relatedTo": newTableName } };
+
+        _recursiveTableUpdateWrapper(schemaCollection, query, updateQry, function(err, result){
+            if(err){
+                deferred.reject(err);
+            } else {
+                deferred.resolve(result);
+            }
+        })();
+
+        return deferred.promise;
+    };
+}
+
+function _updateColumnData (appId, oldTableName, newTableName) {
+     return function () {
+        var deferred = q.defer();
+
+        var schemaCollection = config.mongoClient.db(appId).collection('_Schema');
+
+        schemaCollection.find({}).toArray(function name(err, tables) {
+            if(err){
+             return deferred.reject(err);
+            }
+            var relatedTables = tables.filter(function(table){
+                return table.columns && table.columns.filter(_filterColumnByTableName(newTableName)).length;
+            });
+
+            if(!relatedTables.length){
+                return deferred.resolve([]);
+            }
+            // Update columns relatedTo oldTable to point to newTable
+            var promises = relatedTables.map(_updateEachTable(appId, oldTableName, newTableName));
+
+           return q.all(promises).then(function (updated) {
+                return deferred.resolve(updated);
+            }).catch(function (err) {
+                return deferred.reject(err);
+            });
+        });
+
+        return deferred.promise;
+    };
+}
+
+function _updateEachTable (appId, oldtableName, newTableName){
+    return function(table){
+        var mdeferred = q.defer();
+        var tableCollection = config.mongoClient.db(appId).collection(table.name);
+        var relatedColumns = table.columns.filter(_filterColumnByTableName(newTableName));
+        var relatedPromises = relatedColumns.map(_eachColumnUpdate(oldtableName, newTableName, tableCollection));
+
+        q.all(relatedPromises).then(function (updated) {
+            mdeferred.resolve(updated);
+        }).catch(function (err) {
+            mdeferred.reject(err);
+        });
+
+        return mdeferred.promise;
+    };
+}
+
+function _eachColumnUpdate (oldtableName, newTableName, tableCollection){
+    return function (column) {
+        var rdeferred = q.defer();
+        var constructedQry = {};
+        var updateObject = {};
+        var nameConstruct = column.dataType === 'List' ? column.name + '.$._tableName' : column.name + '._tableName';
+        constructedQry[ column.name + '._tableName' ] = oldtableName;
+        updateObject[ nameConstruct ] = newTableName;
+        var updateQry = { $set: updateObject };
+
+        if( column.dataType === 'List' ){
+            _recursiveTableUpdateWrapper(tableCollection, constructedQry, updateQry, sharedCb)();
+        } else {
+            tableCollection.updateMany(constructedQry, updateQry, {w: 1}, sharedCb);
+        }
+
+        function sharedCb(err, result){
+            if(err){
+                return rdeferred.reject(err);
+            }
+
+            return rdeferred.resolve(result);
+        }
+
+        return rdeferred.promise;
+    };
+}
+
+function _filterColumnByTableName(newName){
+    return function(column){
+        return column.relatedTo === newName;
+    };
+}
+
+function _renameTableInSchema(appId, oldTableName, newTableName) {
+    var deferred = q.defer();
+
+    var collection = config.mongoClient.db(appId).collection("_Schema");
+    collection.findOneAndUpdate({
+        name: oldTableName
+    },
+    {
+        $set: {
+            name: newTableName
+        }
+    }, {
+        returnOriginal: false
+    }, function (err, updated) {
+        if(err){
+         return deferred.reject(err);
+        }
+
+        if(!updated){
+            return deferred.reject('No updates made');
+        }
+
+        return deferred.resolve(updated);
+
+    });
+
+    return deferred.promise;
+}
+
+function _recursiveTableUpdateWrapper (collection, query, updateQry, cb) {
+    return function recursive (err, result, stop){
+        if(stop){
+            return cb(err, result);
+        }
+
+        var promiseFn = collection.find(query).count();
+        return promiseFn.then(function(count){
+            if(count > 0){
+                return collection.update(
+                    query,
+                    updateQry,
+                    { multi: true },
+                    function(err, updated){
+                        if(err){
+                            recursive(err, result, true);
+                        } else {
+                            recursive(err, updated);
+                        }
+                    }
+                );
+            } else {
+                recursive(err, result, true);
+            }
+        });
+    };
 }

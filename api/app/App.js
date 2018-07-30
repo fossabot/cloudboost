@@ -10,6 +10,7 @@ var appService = require('../../services/app');
 var otherService = require('../../services/other');
 var customHelper = require('../../helpers/custom.js');
 var winston = require('winston');
+var _ = require('underscore');
 
 module.exports = function (app) {
     /**
@@ -54,14 +55,10 @@ module.exports = function (app) {
             if (config.secureKey === req.body.secureKey) {
 
                 appService.createApp(appId).then(function (app) {
-
                     appService.createDefaultTables(appId).then(function () {
-
                         delete app.keys.encryption_key;
                         res.status(200).send(app);
                     }, function (err) {
-
-
                         res.status(500).send(err);
                     });
 
@@ -167,6 +164,32 @@ module.exports = function (app) {
 
         apiTracker.log(appId, "App / Table / Delete", req.url, sdk);
     }
+
+    app.put('/table/:appId', function (req, res) {
+        var data = req.body;
+        if(_.isEmpty(data)){
+            return res.status(400).json({
+                message: 'Request body can not be empty'
+            });
+        }
+
+        var newTableName = data.newTableName;
+        var tableName = data.tableName;
+        var appId = req.params.appId;
+        appService.renameTable(appId, tableName, newTableName)
+        .then(function (renamed) {
+            return res.status(200).json({
+                data: renamed,
+                message: 'Successfully renamed table'
+            });
+        })
+        .catch(function (error) {
+            res.status(400).json({
+                error,
+                message: 'Error renaming collection'
+            });
+        });
+    });
 
     //create a table.
     app.put('/app/:appId/:tableName', function (req, res) {
